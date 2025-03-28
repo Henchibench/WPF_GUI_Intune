@@ -14,11 +14,119 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Threading
 
 # Import helper scripts
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 . "$scriptPath\ErrorHandler.ps1"
 . "$scriptPath\TreeViewHelper.ps1"
+
+# Runspace setup for background operations
+$sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 10, $sessionState, $Host)
+$runspacePool.Open()
+
+# Hashtable to track active runspace jobs
+$global:runspaceJobs = @{}
+
+# Function to execute scriptblocks asynchronously
+function Start-AsyncJob {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock,
+        
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Parameters = @{},
+        
+        [Parameter(Mandatory = $true)]
+        [string]$JobName,
+        
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$OnComplete = {}
+    )
+    
+    # Create PowerShell instance and assign runspace
+    $powershell = [powershell]::Create().AddScript($ScriptBlock).AddParameters($Parameters)
+    $powershell.RunspacePool = $runspacePool
+    
+    # Create async result object
+    $asyncObject = New-Object PSObject -Property @{
+        Powershell = $powershell
+        AsyncResult = $powershell.BeginInvoke()
+        JobName = $JobName
+        OnComplete = $OnComplete
+        StartTime = Get-Date
+    }
+    
+    # Store in global tracking hashtable
+    $global:runspaceJobs[$JobName] = $asyncObject
+    
+    # Return the job ID
+    return $JobName
+}
+
+# Function to check for completed jobs
+function Update-AsyncJobs {
+    # Create a safe copy of the job keys to avoid collection modification during enumeration
+    $jobKeys = @($global:runspaceJobs.Keys)
+    $jobsToRemove = @()
+    
+    foreach ($jobName in $jobKeys) {
+        $job = $global:runspaceJobs[$jobName]
+        
+        if ($job.AsyncResult.IsCompleted) {
+            try {
+                $result = $job.Powershell.EndInvoke($job.AsyncResult)
+                
+                # Invoke the OnComplete scriptblock on the UI thread if provided
+                if ($null -ne $job.OnComplete) {
+                    $window.Dispatcher.Invoke([action]{
+                        & $job.OnComplete -Result $result
+                    })
+                }
+            }
+            catch {
+                $errorMsg = "Error in async job '$($job.JobName)': $_"
+                Write-Host $errorMsg -ForegroundColor Red
+                $window.Dispatcher.Invoke([action]{
+                    Write-Terminal "ERROR: $errorMsg"
+                })
+            }
+            finally {
+                $job.Powershell.Dispose()
+                $jobsToRemove += $job.JobName
+            }
+        }
+        elseif ((Get-Date) - $job.StartTime -gt [TimeSpan]::FromMinutes(10)) {
+            # Timeout for jobs running too long (10 minutes)
+            try {
+                $job.Powershell.Stop()
+                $errorMsg = "Job '$($job.JobName)' timed out after 10 minutes"
+                Write-Host $errorMsg -ForegroundColor Yellow
+                $window.Dispatcher.Invoke([action]{
+                    Write-Terminal "WARNING: $errorMsg"
+                })
+            }
+            catch {}
+            finally {
+                $job.Powershell.Dispose()
+                $jobsToRemove += $job.JobName
+            }
+        }
+    }
+    
+    # Remove completed or timed out jobs
+    foreach ($jobName in $jobsToRemove) {
+        $global:runspaceJobs.Remove($jobName)
+    }
+}
+
+# Timer to regularly check for completed jobs
+$jobTimer = New-Object System.Windows.Threading.DispatcherTimer
+$jobTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+$jobTimer.Add_Tick({
+    Update-AsyncJobs
+})
 
 # XAML for the UI
 [xml]$xaml = @"
@@ -71,6 +179,7 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -94,8 +203,26 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
             </Grid>
         </Border>
         
+        <!-- Terminal Output Panel -->
+        <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="10" Padding="10" Margin="0,0,0,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Text="Connection Output" Foreground="#E0E0E0" FontWeight="Bold" Margin="0,0,0,5"/>
+                <ScrollViewer Grid.Row="1" Height="100" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                    <TextBox x:Name="TerminalOutput" Background="#1E1E1E" Foreground="#00FF00" FontFamily="Consolas" 
+                             IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True" BorderThickness="0"/>
+                </ScrollViewer>
+            </Grid>
+        </Border>
+        
         <!-- Search Panel -->
-        <Border Grid.Row="1" Background="#F5F5F5" CornerRadius="10" Padding="10" Margin="0,0,0,10">
+        <Border Grid.Row="2" Background="#F5F5F5" CornerRadius="10" Padding="10" Margin="0,0,0,10">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
@@ -118,7 +245,7 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
         </Border>
         
         <!-- Tree View and Details Panel -->
-        <Grid Grid.Row="2">
+        <Grid Grid.Row="3">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" MinWidth="350"/>
                 <ColumnDefinition Width="*"/>
@@ -138,7 +265,7 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
         </Grid>
         
         <!-- Status Bar -->
-        <Border Grid.Row="3" Background="#F5F5F5" CornerRadius="10" Padding="5" Margin="0,10,0,0">
+        <Border Grid.Row="4" Background="#F5F5F5" CornerRadius="10" Padding="5" Margin="0,10,0,0">
             <StackPanel Orientation="Horizontal">
                 <TextBlock x:Name="StatusBar" Text="Ready" Padding="5"/>
                 <ProgressBar x:Name="ProgressIndicator" Width="100" Height="15" Margin="10,0,0,0" Visibility="Collapsed"/>
@@ -164,6 +291,12 @@ $detailsPanel = $window.FindName('DetailsPanel')
 $statusBar = $window.FindName('StatusBar')
 $progressIndicator = $window.FindName('ProgressIndicator')
 $preloadButton = $window.FindName('PreloadButton')
+$terminalOutput = $window.FindName('TerminalOutput')
+
+# Initialize the terminal with a welcome message
+$terminalOutput.AppendText("Welcome to Intune Explorer - Terminal view is active`n")
+$terminalOutput.AppendText("Use the controls above to connect to Microsoft Graph and search for devices/groups`n")
+$terminalOutput.AppendText("----------------------------------------`n")
 
 # Global variables
 $global:connectedToGraph = $false
@@ -198,45 +331,123 @@ function Show-Progress {
     }
 }
 
+# Function to add a message to the terminal output
+function Write-Terminal {
+    param([string]$message)
+    
+    if ($null -eq $terminalOutput) { return }
+    
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $terminalOutput.AppendText("[$timestamp] $message`n")
+    $terminalOutput.ScrollToEnd()
+}
+
+# Function to clear the terminal output
+function Clear-Terminal {
+    if ($null -eq $terminalOutput) { return }
+    
+    $terminalOutput.Clear()
+}
+
 # Function to connect to Microsoft Graph
 function Connect-ToGraph {
     try {
-        # Update status
+        # Clear terminal and update status
+        Clear-Terminal
         $statusBar.Text = "Connecting to Microsoft Graph..."
         Show-Progress $true
+        Write-Terminal "Starting connection to Microsoft Graph..."
         
-        # Import necessary modules
-        Import-Module Microsoft.Graph.Authentication
+        # Disable the connect button while connecting to prevent multiple clicks
+        $connectButton.IsEnabled = $false
         
-        # Connect to Microsoft Graph
-        Connect-MgGraph
+        # Define the connection script block that will run in the background
+        $connectionScriptBlock = {
+            try {
+                # Import necessary modules
+                Import-Module Microsoft.Graph.Authentication
+                
+                # Connect to Microsoft Graph
+                Connect-MgGraph
+                
+                # Get the connected account
+                $account = (Get-MgContext).Account
+                
+                # Return the account info
+                return @{
+                    Success = $true
+                    Account = $account
+                }
+            }
+            catch {
+                return @{
+                    Success = $false
+                    Error = $_.Exception.Message
+                    StackTrace = $_.ScriptStackTrace
+                }
+            }
+        }
         
-        # Update UI
-        $connectionStatus.Text = "Connected: $((Get-MgContext).Account)"
-        $global:connectedToGraph = $true
-        $connectButton.Content = "Disconnect"
-        $refreshButton.IsEnabled = $true
-        $statusBar.Text = "Connected. Retrieving data..."
+        # Define what happens when the async job completes
+        $onCompleteAction = {
+            param($Result)
+            
+            try {
+                if ($Result.Success) {
+                    # Update UI with successful connection
+                    $account = $Result.Account
+                    $connectionStatus.Text = "Connected: $account"
+                    $global:connectedToGraph = $true
+                    $connectButton.Content = "Disconnect"
+                    $refreshButton.IsEnabled = $true
+                    $statusBar.Text = "Connected. Retrieving data..."
+                    Write-Terminal "Successfully connected to Microsoft Graph as: $account"
+                    Write-Terminal "Connection established. Starting to retrieve Intune data..."
+                    
+                    # Enable UI elements for interaction
+                    $refreshButton.IsEnabled = $true
+                    $searchButton.IsEnabled = $true
+                    $searchTextBox.IsEnabled = $true
+                    $preloadButton.IsEnabled = $true
+                    
+                    # Initial data load (also asynchronous)
+                    Write-Terminal "Fetching initial Intune data..."
+                    FetchIntuneData
+                }
+                else {
+                    # Update UI with error
+                    $errorMessage = $Result.Error
+                    $connectionStatus.Text = "Error connecting: $errorMessage"
+                    $statusBar.Text = "Error connecting"
+                    Write-Terminal "ERROR: Failed to connect to Microsoft Graph: $errorMessage"
+                    Write-Terminal "Stack Trace: $($Result.StackTrace)"
+                    Write-Error "Error connecting to Microsoft Graph: $errorMessage"
+                    
+                    # Re-enable the connect button to allow retry
+                    $connectButton.Content = "Connect to Microsoft Graph"
+                    Show-Progress $false
+                }
+            }
+            finally {
+                # Always re-enable the connect button
+                $connectButton.IsEnabled = $true
+            }
+        }
         
-        # Enable UI elements for interaction
-        $refreshButton.IsEnabled = $true
-        $searchButton.IsEnabled = $true
-        $searchTextBox.IsEnabled = $true
-        $preloadButton.IsEnabled = $true
-        
-        # Initial data load
-        FetchIntuneData
-        
-        # Automatically pre-load assignments after initial data load
-        $statusBar.Text = "Starting automatic assignment pre-loading..."
-        PreLoad-PolicyAssignments
+        # Start the async job
+        Write-Terminal "Initiating Graph connection - you may see a sign-in prompt..."
+        Start-AsyncJob -ScriptBlock $connectionScriptBlock -JobName "GraphConnection" -OnComplete $onCompleteAction
     }
     catch {
-        $connectionStatus.Text = "Error connecting: $($_.Exception.Message)"
+        $errorMessage = $_.Exception.Message
+        $connectionStatus.Text = "Error preparing connection: $errorMessage"
         $statusBar.Text = "Error connecting"
-        Write-Error "Error connecting to Microsoft Graph: $_"
-    }
-    finally {
+        Write-Terminal "ERROR: Failed to prepare Graph connection: $errorMessage"
+        Write-Terminal "Stack Trace: $($_.ScriptStackTrace)"
+        Write-Error "Error preparing Graph connection: $_"
+        
+        # Re-enable the connect button
+        $connectButton.IsEnabled = $true
         Show-Progress $false
     }
 }
@@ -244,6 +455,7 @@ function Connect-ToGraph {
 # Function to disconnect from Microsoft Graph
 function Disconnect-FromGraph {
     try {
+        Write-Terminal "Disconnecting from Microsoft Graph..."
         Show-Progress $true
         Disconnect-MgGraph
         $connectionStatus.Text = "Not Connected"
@@ -251,12 +463,15 @@ function Disconnect-FromGraph {
         $connectButton.Content = "Connect to Microsoft Graph"
         $refreshButton.IsEnabled = $false
         $statusBar.Text = "Disconnected from Microsoft Graph"
+        Write-Terminal "Successfully disconnected from Microsoft Graph."
         
         # Clear the TreeView
         $intuneTreeView.Items.Clear()
         $detailsPanel.Children.Clear()
+        Write-Terminal "UI cleared - application is ready for a new connection."
         
         # Clear cached data
+        Write-Terminal "Clearing cached data..."
         $global:cachedData.Devices = $null
         $global:cachedData.Users = $null
         $global:cachedData.Apps = $null
@@ -270,9 +485,12 @@ function Disconnect-FromGraph {
         $global:cachedData.CompliancePolicyAssignments = @{}
         $global:cachedData.DeviceConfigAssignments = @{}
         $global:cachedData.AppAssignments = @{}
+        Write-Terminal "All cached data cleared successfully."
     }
     catch {
+        $errorMessage = $_.Exception.Message
         $statusBar.Text = "Disconnection failed: $_"
+        Write-Terminal "ERROR: Failed to disconnect: $errorMessage"
     }
     finally {
         Show-Progress $false
@@ -336,6 +554,7 @@ function FetchIntuneData {
     try {
         Show-Progress $true
         $statusBar.Text = "Refreshing data..."
+        Write-Terminal "Starting to fetch Intune data..."
         
         # Clear existing data
         $global:cachedData = @{
@@ -351,6 +570,7 @@ function FetchIntuneData {
             DeviceConfigAssignments = @{}
             AppAssignments = @{}
         }
+        Write-Terminal "Cleared existing cached data."
         
         # Reset preload button state
         $preloadButton.Content = "Pre-load Assignments"
@@ -359,39 +579,120 @@ function FetchIntuneData {
         # Clear the treeview
         $intuneTreeView.Items.Clear()
         
-        # Load basic data (this makes the UI responsive without waiting for all data)
-        try {
-            $statusBar.Text = "Loading groups..."
-            $global:cachedData.Groups = Get-MgGroup -All -ErrorAction Stop
-        }
-        catch {
-            Write-Host "Error fetching groups: $_" -ForegroundColor Red
+        # Define the data fetching script block
+        $fetchDataScriptBlock = {
+            # Initialize results container
+            $results = @{
+                Groups = $null
+                Devices = $null
+                Users = $null
+                Errors = @{}
+            }
+            
+            try {
+                # Fetch groups
+                try {
+                    $results.Groups = Get-MgGroup -All -ErrorAction Stop
+                }
+                catch {
+                    $results.Errors["Groups"] = @{
+                        Message = $_.Exception.Message
+                        StackTrace = $_.ScriptStackTrace
+                    }
+                }
+                
+                # Fetch devices
+                try {
+                    $results.Devices = Get-MgBetaDeviceManagementManagedDevice -All -ErrorAction Stop
+                }
+                catch {
+                    $results.Errors["Devices"] = @{
+                        Message = $_.Exception.Message
+                        StackTrace = $_.ScriptStackTrace
+                    }
+                }
+                
+                # Fetch users
+                try {
+                    $results.Users = Get-MgUser -All -ErrorAction Stop
+                }
+                catch {
+                    $results.Errors["Users"] = @{
+                        Message = $_.Exception.Message
+                        StackTrace = $_.ScriptStackTrace
+                    }
+                }
+            }
+            catch {
+                $results.Errors["General"] = @{
+                    Message = $_.Exception.Message
+                    StackTrace = $_.ScriptStackTrace
+                }
+            }
+            
+            return $results
         }
         
-        try {
-            $statusBar.Text = "Loading devices..."
-            $global:cachedData.Devices = Get-MgBetaDeviceManagementManagedDevice -All -ErrorAction Stop
-        }
-        catch {
-            Write-Host "Error fetching devices: $_" -ForegroundColor Red
+        # Define what happens when the async job completes
+        $onCompleteAction = {
+            param($Result)
+            
+            # Process and store the fetched data
+            if ($Result.Groups) {
+                $global:cachedData.Groups = $Result.Groups
+                $groupCount = $Result.Groups.Count
+                Write-Terminal "Successfully loaded $groupCount groups."
+            }
+            elseif ($Result.Errors.ContainsKey("Groups")) {
+                $errorMessage = $Result.Errors["Groups"].Message
+                Write-Terminal "ERROR: Failed to fetch groups: $errorMessage"
+            }
+            
+            if ($Result.Devices) {
+                $global:cachedData.Devices = $Result.Devices
+                $deviceCount = $Result.Devices.Count
+                Write-Terminal "Successfully loaded $deviceCount devices."
+            }
+            elseif ($Result.Errors.ContainsKey("Devices")) {
+                $errorMessage = $Result.Errors["Devices"].Message
+                Write-Terminal "ERROR: Failed to fetch devices: $errorMessage"
+            }
+            
+            if ($Result.Users) {
+                $global:cachedData.Users = $Result.Users
+                $userCount = $Result.Users.Count
+                Write-Terminal "Successfully loaded $userCount users."
+            }
+            elseif ($Result.Errors.ContainsKey("Users")) {
+                $errorMessage = $Result.Errors["Users"].Message
+                Write-Terminal "ERROR: Failed to fetch users: $errorMessage"
+            }
+            
+            # Data loaded successfully
+            $statusBar.Text = "Basic data loaded. Use the search box or click Pre-load Assignments."
+            Write-Terminal "Basic data load complete. UI is now ready for use."
+            
+            # Wait a brief moment to ensure the UI thread is responsive
+            Start-Sleep -Milliseconds 500
+            
+            # Automatically start pre-loading assignments in a new async job
+            $window.Dispatcher.InvokeAsync({
+                $statusBar.Text = "Starting automatic assignment pre-loading..."
+                Write-Terminal "Starting automatic pre-loading of assignments..."
+                PreLoad-PolicyAssignments
+            })
+            
+            Show-Progress $false
         }
         
-        try {
-            $statusBar.Text = "Loading users..."
-            $global:cachedData.Users = Get-MgUser -All -ErrorAction Stop
-        }
-        catch {
-            Write-Host "Error fetching users: $_" -ForegroundColor Red
-        }
-        
-        # Data loaded successfully
-        $statusBar.Text = "Basic data loaded. Starting assignment pre-loading automatically..."
+        # Start the async job
+        Start-AsyncJob -ScriptBlock $fetchDataScriptBlock -JobName "FetchIntuneData" -OnComplete $onCompleteAction
     }
     catch {
-        $statusBar.Text = "Error refreshing data: $($_.Exception.Message)"
-        Write-Error "Error refreshing data: $_"
-    }
-    finally {
+        $errorMessage = $_.Exception.Message
+        $statusBar.Text = "Error starting data refresh: $errorMessage"
+        Write-Error "Error starting data refresh: $_"
+        Write-Terminal "ERROR: Failed to start data refresh: $errorMessage"
         Show-Progress $false
     }
 }
@@ -403,6 +704,7 @@ function Search-Item {
     # Ensure we have a valid search type selection
     if ($null -eq $searchTypeComboBox.SelectedItem) {
         $statusBar.Text = "Please select a search type"
+        Write-Terminal "ERROR: No search type selected"
         return
     }
     
@@ -410,16 +712,19 @@ function Search-Item {
     
     if ([string]::IsNullOrEmpty($searchTerm)) {
         $statusBar.Text = "Please enter a search term"
+        Write-Terminal "ERROR: No search term entered"
         return
     }
     
     if (-not $global:connectedToGraph) {
         $statusBar.Text = "Please connect to Microsoft Graph first"
+        Write-Terminal "ERROR: Not connected to Microsoft Graph"
         return
     }
     
     Show-Progress $true
     $statusBar.Text = "Searching for $($searchType): $searchTerm..."
+    Write-Terminal "Searching for $searchType matching: '$searchTerm'..."
     
     try {
         # Clear the TreeView
@@ -431,10 +736,12 @@ function Search-Item {
                 try {
                     # Ensure devices are fetched
                     if ($null -eq $global:cachedData.Devices) {
+                        Write-Terminal "No cached devices found. Fetching devices first..."
                         FetchIntuneData
                     }
                     
                     # Find devices matching the search term
+                    Write-Terminal "Searching through $($global:cachedData.Devices.Count) devices..."
                     $matchingDevices = $global:cachedData.Devices | Where-Object { 
                         $_.DeviceName -like "*$searchTerm*" -or 
                         $_.SerialNumber -like "*$searchTerm*" -or 
@@ -443,6 +750,7 @@ function Search-Item {
                     
                     if ($null -eq $matchingDevices -or ($matchingDevices -is [array] -and $matchingDevices.Count -eq 0)) {
                         $statusBar.Text = "No matching devices found"
+                        Write-Terminal "No devices found matching: '$searchTerm'"
                         return
                     }
                     
@@ -452,16 +760,19 @@ function Search-Item {
                     }
                     
                     # Display the matching devices in the TreeView
+                    Write-Terminal "Adding $($matchingDevices.Count) matching devices to the tree view..."
                     foreach ($device in $matchingDevices) {
                         Add-DeviceToTreeView -TreeView $intuneTreeView -Device $device
                     }
                     
                     $statusBar.Text = "Found $($matchingDevices.Count) devices"
+                    Write-Terminal "✅ Successfully found and displayed $($matchingDevices.Count) matching devices"
                 }
                 catch {
                     $errorMsg = "Error searching for devices: $_"
                     Write-Host $errorMsg -ForegroundColor Red
                     $statusBar.Text = $errorMsg
+                    Write-Terminal "ERROR: $errorMsg"
                 }
             }
             
@@ -470,13 +781,16 @@ function Search-Item {
                     # Ensure groups are fetched
                     if ($null -eq $global:cachedData.Groups) {
                         $statusBar.Text = "Fetching groups..."
+                        Write-Terminal "No cached groups found. Fetching groups first..."
                         try {
                             $global:cachedData.Groups = Get-MgBetaGroup -All -ErrorAction Stop
+                            Write-Terminal "Successfully fetched $($global:cachedData.Groups.Count) groups"
                         }
                         catch {
                             $errorMsg = "Failed to fetch groups: $_. Please check your permissions."
                             Write-Host $errorMsg -ForegroundColor Red
                             $statusBar.Text = $errorMsg
+                            Write-Terminal "ERROR: $errorMsg"
                             Show-Progress $false
                             return
                         }
@@ -484,11 +798,13 @@ function Search-Item {
                     
                     if ($null -eq $global:cachedData.Groups) {
                         $statusBar.Text = "Unable to retrieve groups. Check your connection and permissions."
+                        Write-Terminal "ERROR: Unable to retrieve groups. Check connection and permissions."
                         Show-Progress $false
                         return
                     }
                     
                     # Find groups matching the search term
+                    Write-Terminal "Searching through $($global:cachedData.Groups.Count) groups..."
                     $matchingGroups = $global:cachedData.Groups | Where-Object {
                         $_.DisplayName -like "*$searchTerm*" -or
                         $_.Id -like "*$searchTerm*"
@@ -496,6 +812,7 @@ function Search-Item {
                     
                     if ($null -eq $matchingGroups -or ($matchingGroups -is [array] -and $matchingGroups.Count -eq 0)) {
                         $statusBar.Text = "No matching groups found"
+                        Write-Terminal "No groups found matching: '$searchTerm'"
                         return
                     }
                     
@@ -505,6 +822,7 @@ function Search-Item {
                     }
                     
                     # Display the matching groups in the TreeView
+                    Write-Terminal "Found $($matchingGroups.Count) matching groups. Adding to tree view..."
                     $groupsAdded = 0
                     foreach ($group in $matchingGroups) {
                         try {
@@ -517,26 +835,31 @@ function Search-Item {
                                 $groupsAdded++
                             } else {
                                 Write-Host "Failed to add group '$groupName' to tree view" -ForegroundColor Yellow
+                                Write-Terminal "WARNING: Failed to add group '$groupName' to tree view"
                             }
                         }
                         catch {
                             Write-Host "Error adding group '$groupName' to tree view: $_" -ForegroundColor Red
+                            Write-Terminal "ERROR: Failed to add group '$groupName': $($_.Exception.Message)"
                             # Continue with the next group
                         }
                     }
                     
                     if ($groupsAdded -gt 0) {
                         $statusBar.Text = "Found $groupsAdded groups"
+                        Write-Terminal "✅ Successfully added $groupsAdded of $($matchingGroups.Count) groups to the tree view"
                     }
                     else {
                         $statusBar.Text = "Found $($matchingGroups.Count) groups but none could be displayed. Check the console for errors."
                         Write-Host "Error: All groups found, but none could be displayed. You may need additional permissions." -ForegroundColor Red
+                        Write-Terminal "ERROR: Found $($matchingGroups.Count) groups but none could be displayed. Check permissions."
                     }
                 }
                 catch {
                     $errorMsg = "Error searching for groups: $_"
                     Write-Host $errorMsg -ForegroundColor Red 
                     $statusBar.Text = $errorMsg
+                    Write-Terminal "ERROR: $errorMsg"
                 }
             }
         }
@@ -545,6 +868,7 @@ function Search-Item {
         $errorMsg = "Error in Search-Item: $_"
         Write-Host $errorMsg -ForegroundColor Red
         $statusBar.Text = $errorMsg
+        Write-Terminal "ERROR: $errorMsg"
     }
     finally {
         Show-Progress $false
@@ -1019,149 +1343,289 @@ function PreLoad-PolicyAssignments {
         # Update status
         $statusBar.Text = "Pre-loading policy assignments..."
         Show-Progress $true
+        Write-Terminal "Starting to pre-load all policy assignments..."
+        
+        # Disable preload button while loading
+        $preloadButton.IsEnabled = $false
         
         # Clear any existing assignment data to start fresh
         $global:cachedData.ConfigPolicyAssignments = @{}
         $global:cachedData.CompliancePolicyAssignments = @{}
         $global:cachedData.DeviceConfigAssignments = @{}
         $global:cachedData.AppAssignments = @{}
+        Write-Terminal "Cleared existing assignment data."
         
-        # Track counts for reporting
-        $totalAssignmentsLoaded = 0
-        $totalPoliciesWithAssignments = 0
-        
-        # Load configuration policies if they're not already loaded
-        if ($null -eq $global:cachedData.ConfigPolicies) {
-            $statusBar.Text = "Loading configuration policies..."
-            $global:cachedData.ConfigPolicies = Get-MgBetaDeviceManagementConfigurationPolicy -All -ErrorAction SilentlyContinue
-        }
-        
-        # For each policy, pre-fetch and cache its assignments
-        $totalPolicies = $global:cachedData.ConfigPolicies.Count
-        $counter = 0
-        
-        foreach ($policy in $global:cachedData.ConfigPolicies) {
-            $counter++
-            $statusBar.Text = "Loading config policy assignments ($counter of $totalPolicies)..."
+        # Define the pre-loading script block
+        $preloadScriptBlock = {
+            # Initialize results container
+            $results = @{
+                TotalAssignmentsLoaded = 0
+                TotalPoliciesWithAssignments = 0
+                ConfigPolicies = $null
+                CompliancePolicies = $null
+                DeviceConfigs = $null
+                Apps = $null
+                ConfigPolicyAssignments = @{}
+                CompliancePolicyAssignments = @{}
+                DeviceConfigAssignments = @{}
+                AppAssignments = @{}
+                Errors = @{}
+                Progress = @{}
+            }
+            
+            # Function to safely make Graph requests in the background job
+            function Invoke-SafeGraphRequest {
+                param($Uri, $PolicyId, $PolicyName, $PolicyType)
+                
+                try {
+                    $response = Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
+                    return @{
+                        Success = $true
+                        Data = $response
+                    }
+                }
+                catch {
+                    return @{
+                        Success = $false
+                        PolicyId = $PolicyId
+                        PolicyName = $PolicyName
+                        PolicyType = $PolicyType
+                        Error = $_.Exception.Message
+                    }
+                }
+            }
             
             try {
-                $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies('$($policy.Id)')/assignments"
-                $assignments = Invoke-MgGraphRequest -Method GET -Uri $assignmentsUri -ErrorAction SilentlyContinue
+                # 1. Fetch configuration policies if needed
+                try {
+                    $results.ConfigPolicies = Get-MgBetaDeviceManagementConfigurationPolicy -All -ErrorAction Stop
+                    $results.Progress["ConfigPolicies"] = "Loaded $($results.ConfigPolicies.Count) configuration policies"
+                }
+                catch {
+                    $results.Errors["ConfigPolicies"] = @{
+                        Message = "Failed to load configuration policies: $($_.Exception.Message)"
+                    }
+                }
                 
-                if ($assignments -and $assignments.Value) {
-                    $global:cachedData.ConfigPolicyAssignments[$policy.Id] = $assignments.Value
-                    $totalAssignmentsLoaded += $assignments.Value.Count
-                    $totalPoliciesWithAssignments++
+                # 2. Process configuration policy assignments
+                if ($results.ConfigPolicies) {
+                    $totalPolicies = $results.ConfigPolicies.Count
+                    $counter = 0
+                    
+                    foreach ($policy in $results.ConfigPolicies) {
+                        $counter++
+                        $results.Progress["ConfigProgress"] = "Processing config policy $counter of $totalPolicies"
+                        
+                        $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies('$($policy.Id)')/assignments"
+                        $response = Invoke-SafeGraphRequest -Uri $assignmentsUri -PolicyId $policy.Id -PolicyName $policy.Name -PolicyType "Configuration"
+                        
+                        if ($response.Success -and $response.Data -and $response.Data.Value) {
+                            $results.ConfigPolicyAssignments[$policy.Id] = $response.Data.Value
+                            $results.TotalAssignmentsLoaded += $response.Data.Value.Count
+                            $results.TotalPoliciesWithAssignments++
+                        }
+                    }
+                    $results.Progress["ConfigPoliciesDone"] = "Completed processing $totalPolicies configuration policies"
+                }
+                
+                # 3. Fetch compliance policies if needed
+                try {
+                    $results.CompliancePolicies = Get-MgBetaDeviceManagementCompliancePolicy -All -ErrorAction Stop
+                    $results.Progress["CompliancePolicies"] = "Loaded $($results.CompliancePolicies.Count) compliance policies"
+                }
+                catch {
+                    $results.Errors["CompliancePolicies"] = @{
+                        Message = "Failed to load compliance policies: $($_.Exception.Message)"
+                    }
+                }
+                
+                # 4. Process compliance policy assignments
+                if ($results.CompliancePolicies) {
+                    $totalPolicies = $results.CompliancePolicies.Count
+                    $counter = 0
+                    
+                    foreach ($policy in $results.CompliancePolicies) {
+                        $counter++
+                        $results.Progress["ComplianceProgress"] = "Processing compliance policy $counter of $totalPolicies"
+                        
+                        $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies('$($policy.Id)')/assignments"
+                        $response = Invoke-SafeGraphRequest -Uri $assignmentsUri -PolicyId $policy.Id -PolicyName $policy.DisplayName -PolicyType "Compliance"
+                        
+                        if ($response.Success -and $response.Data -and $response.Data.Value) {
+                            $results.CompliancePolicyAssignments[$policy.Id] = $response.Data.Value
+                            $results.TotalAssignmentsLoaded += $response.Data.Value.Count
+                            $results.TotalPoliciesWithAssignments++
+                        }
+                    }
+                    $results.Progress["CompliancePoliciesDone"] = "Completed processing $totalPolicies compliance policies"
+                }
+                
+                # 5. Fetch device configurations if needed
+                try {
+                    $results.DeviceConfigs = Get-MgBetaDeviceManagementDeviceConfiguration -All -ErrorAction Stop
+                    $results.Progress["DeviceConfigs"] = "Loaded $($results.DeviceConfigs.Count) device configurations"
+                }
+                catch {
+                    $results.Errors["DeviceConfigs"] = @{
+                        Message = "Failed to load device configurations: $($_.Exception.Message)"
+                    }
+                }
+                
+                # 6. Process device configuration assignments
+                if ($results.DeviceConfigs) {
+                    $totalConfigs = $results.DeviceConfigs.Count
+                    $counter = 0
+                    
+                    foreach ($config in $results.DeviceConfigs) {
+                        $counter++
+                        $results.Progress["DeviceConfigProgress"] = "Processing device config $counter of $totalConfigs"
+                        
+                        $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations('$($config.Id)')/assignments"
+                        $response = Invoke-SafeGraphRequest -Uri $assignmentsUri -PolicyId $config.Id -PolicyName $config.DisplayName -PolicyType "DeviceConfig"
+                        
+                        if ($response.Success -and $response.Data -and $response.Data.Value) {
+                            $results.DeviceConfigAssignments[$config.Id] = $response.Data.Value
+                            $results.TotalAssignmentsLoaded += $response.Data.Value.Count
+                            $results.TotalPoliciesWithAssignments++
+                        }
+                    }
+                    $results.Progress["DeviceConfigsDone"] = "Completed processing $totalConfigs device configurations"
+                }
+                
+                # 7. Fetch mobile apps if needed
+                try {
+                    $results.Apps = Get-MgBetaDeviceAppManagementMobileApp -All -ErrorAction Stop
+                    $results.Progress["Apps"] = "Loaded $($results.Apps.Count) mobile apps"
+                }
+                catch {
+                    $results.Errors["Apps"] = @{
+                        Message = "Failed to load mobile apps: $($_.Exception.Message)"
+                    }
+                }
+                
+                # 8. Process app assignments
+                if ($results.Apps) {
+                    $totalApps = $results.Apps.Count
+                    $counter = 0
+                    
+                    foreach ($app in $results.Apps) {
+                        $counter++
+                        $results.Progress["AppProgress"] = "Processing app $counter of $totalApps"
+                        
+                        $assignmentsUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('$($app.Id)')/assignments"
+                        $response = Invoke-SafeGraphRequest -Uri $assignmentsUri -PolicyId $app.Id -PolicyName $app.DisplayName -PolicyType "App"
+                        
+                        if ($response.Success -and $response.Data -and $response.Data.Value) {
+                            $results.AppAssignments[$app.Id] = $response.Data.Value
+                            $results.TotalAssignmentsLoaded += $response.Data.Value.Count
+                            $results.TotalPoliciesWithAssignments++
+                        }
+                    }
+                    $results.Progress["AppsDone"] = "Completed processing $totalApps mobile apps"
                 }
             }
             catch {
-                Write-Host "Error fetching assignments for policy $($policy.Name): $_" -ForegroundColor Yellow
-            }
-        }
-        
-        # Load compliance policies if they're not already loaded
-        if ($null -eq $global:cachedData.CompliancePolicies) {
-            $statusBar.Text = "Loading compliance policies..."
-            $global:cachedData.CompliancePolicies = Get-MgBetaDeviceManagementCompliancePolicy -All -ErrorAction SilentlyContinue
-        }
-        
-        # For each compliance policy, pre-fetch and cache its assignments
-        $totalPolicies = $global:cachedData.CompliancePolicies.Count
-        $counter = 0
-        
-        foreach ($policy in $global:cachedData.CompliancePolicies) {
-            $counter++
-            $statusBar.Text = "Loading compliance policy assignments ($counter of $totalPolicies)..."
-            
-            try {
-                $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies('$($policy.Id)')/assignments"
-                $assignments = Invoke-MgGraphRequest -Method GET -Uri $assignmentsUri -ErrorAction SilentlyContinue
-                
-                if ($assignments -and $assignments.Value) {
-                    $global:cachedData.CompliancePolicyAssignments[$policy.Id] = $assignments.Value
-                    $totalAssignmentsLoaded += $assignments.Value.Count
-                    $totalPoliciesWithAssignments++
+                $results.Errors["General"] = @{
+                    Message = $_.Exception.Message
+                    StackTrace = $_.ScriptStackTrace
                 }
             }
-            catch {
-                Write-Host "Error fetching assignments for compliance policy $($policy.DisplayName): $_" -ForegroundColor Yellow
-            }
-        }
-        
-        # Load device configurations if they're not already loaded
-        if ($null -eq $global:cachedData.DeviceConfigs) {
-            $statusBar.Text = "Loading device configurations..."
-            $global:cachedData.DeviceConfigs = Get-MgBetaDeviceManagementDeviceConfiguration -All -ErrorAction SilentlyContinue
-        }
-        
-        # For each device config, pre-fetch and cache its assignments
-        $totalConfigs = $global:cachedData.DeviceConfigs.Count
-        $counter = 0
-        
-        foreach ($config in $global:cachedData.DeviceConfigs) {
-            $counter++
-            $statusBar.Text = "Loading device config assignments ($counter of $totalConfigs)..."
             
-            try {
-                $assignmentsUri = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations('$($config.Id)')/assignments"
-                $assignments = Invoke-MgGraphRequest -Method GET -Uri $assignmentsUri -ErrorAction SilentlyContinue
-                
-                if ($assignments -and $assignments.Value) {
-                    $global:cachedData.DeviceConfigAssignments[$config.Id] = $assignments.Value
-                    $totalAssignmentsLoaded += $assignments.Value.Count
-                    $totalPoliciesWithAssignments++
+            return $results
+        }
+        
+        # Define what happens when the async job completes or provides progress
+        $onCompleteAction = {
+            param($Result)
+            
+            # Store the cached data
+            if ($Result.ConfigPolicies) {
+                $global:cachedData.ConfigPolicies = $Result.ConfigPolicies
+                $configPoliciesCount = $Result.ConfigPolicies.Count
+                Write-Terminal "Stored $configPoliciesCount configuration policies."
+            }
+            
+            if ($Result.CompliancePolicies) {
+                $global:cachedData.CompliancePolicies = $Result.CompliancePolicies
+                $compliancePoliciesCount = $Result.CompliancePolicies.Count
+                Write-Terminal "Stored $compliancePoliciesCount compliance policies."
+            }
+            
+            if ($Result.DeviceConfigs) {
+                $global:cachedData.DeviceConfigs = $Result.DeviceConfigs
+                $deviceConfigsCount = $Result.DeviceConfigs.Count
+                Write-Terminal "Stored $deviceConfigsCount device configurations."
+            }
+            
+            if ($Result.Apps) {
+                $global:cachedData.Apps = $Result.Apps
+                $appsCount = $Result.Apps.Count
+                Write-Terminal "Stored $appsCount applications."
+            }
+            
+            # Store all the assignments
+            $global:cachedData.ConfigPolicyAssignments = $Result.ConfigPolicyAssignments
+            $global:cachedData.CompliancePolicyAssignments = $Result.CompliancePolicyAssignments
+            $global:cachedData.DeviceConfigAssignments = $Result.DeviceConfigAssignments
+            $global:cachedData.AppAssignments = $Result.AppAssignments
+            
+            # Report any errors
+            if ($Result.Errors.Count -gt 0) {
+                foreach ($errorType in $Result.Errors.Keys) {
+                    Write-Terminal "ERROR in ${errorType}: $($Result.Errors[$errorType].Message)"
                 }
             }
-            catch {
-                Write-Host "Error fetching assignments for device config $($config.DisplayName): $_" -ForegroundColor Yellow
-            }
-        }
-        
-        # Load mobile apps if they're not already loaded
-        if ($null -eq $global:cachedData.Apps) {
-            $statusBar.Text = "Loading mobile apps..."
-            $global:cachedData.Apps = Get-MgBetaDeviceAppManagementMobileApp -All -ErrorAction SilentlyContinue
-        }
-        
-        # For each app, pre-fetch and cache its assignments
-        $totalApps = $global:cachedData.Apps.Count
-        $counter = 0
-        
-        foreach ($app in $global:cachedData.Apps) {
-            $counter++
-            $statusBar.Text = "Loading app assignments ($counter of $totalApps)..."
             
-            try {
-                $assignmentsUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('$($app.Id)')/assignments"
-                $assignments = Invoke-MgGraphRequest -Method GET -Uri $assignmentsUri -ErrorAction SilentlyContinue
-                
-                if ($assignments -and $assignments.Value) {
-                    $global:cachedData.AppAssignments[$app.Id] = $assignments.Value
-                    $totalAssignmentsLoaded += $assignments.Value.Count
-                    $totalPoliciesWithAssignments++
+            # Update UI with completion status
+            $totalAssignmentsLoaded = $Result.TotalAssignmentsLoaded
+            $totalPoliciesWithAssignments = $Result.TotalPoliciesWithAssignments
+            
+            $statusBar.Text = "Assignment data pre-loaded: $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources."
+            $preloadButton.Content = "Assignments Pre-loaded"
+            
+            Write-Terminal "✅ All assignments pre-loaded: $totalAssignmentsLoaded total assignments for $totalPoliciesWithAssignments resources."
+            
+            # Add tooltip with details
+            $preloadButton.ToolTip = "Loaded $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources (policies, configurations, and apps)"
+            
+            # Re-enable the preload button
+            $preloadButton.IsEnabled = $true
+            Show-Progress $false
+        }
+        
+        # Set up progress reporting
+        $progressReportAction = {
+            param($ProgressData)
+            
+            # Update UI with progress information
+            if ($ProgressData -and $ProgressData.Progress) {
+                foreach ($progressKey in $ProgressData.Progress.Keys) {
+                    $progressMessage = $ProgressData.Progress[$progressKey]
+                    $statusBar.Text = $progressMessage
+                    Write-Terminal $progressMessage
                 }
             }
-            catch {
-                Write-Host "Error fetching assignments for app $($app.DisplayName): $_" -ForegroundColor Yellow
-            }
         }
         
-        # Update status with counts and disable pre-load button (since data is now loaded)
-        $statusBar.Text = "Assignment data pre-loaded: $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources."
-        $preloadButton.Content = "Assignments Pre-loaded"
-        $preloadButton.IsEnabled = $false
-        
-        # Add tooltip with details
-        $preloadButton.ToolTip = "Loaded $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources (policies, configurations, and apps)"
+        # Start the async job
+        Start-AsyncJob -ScriptBlock $preloadScriptBlock -JobName "PreloadAssignments" -OnComplete $onCompleteAction
     }
     catch {
-        $statusBar.Text = "Error pre-loading assignments: $($_.Exception.Message)"
-        Write-Error "Error pre-loading assignments: $_"
-    }
-    finally {
+        $errorMessage = $_.Exception.Message
+        $statusBar.Text = "Error starting pre-load: $errorMessage"
+        Write-Error "Error starting pre-load: $_"
+        Write-Terminal "ERROR: Failed to start pre-loading assignments: $errorMessage"
+        Write-Terminal "Stack Trace: $($_.ScriptStackTrace)"
+        
+        # Re-enable the preload button
+        $preloadButton.IsEnabled = $true
         Show-Progress $false
     }
 }
+
+# Start the timer to check for completed async jobs
+$jobTimer.Start()
+Write-Terminal "Async job processor started successfully"
 
 # Start the application
 $window.ShowDialog() | Out-Null 
