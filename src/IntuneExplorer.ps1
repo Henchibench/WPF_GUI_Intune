@@ -87,7 +87,10 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
                     <Button x:Name="ConnectButton" Content="Connect to Microsoft Graph" Width="200" HorizontalAlignment="Left"/>
                     <TextBlock x:Name="ConnectionStatus" Text="Not Connected" Margin="5"/>
                 </StackPanel>
-                <Button x:Name="RefreshButton" Content="Refresh Data" Grid.Column="1" VerticalAlignment="Top" IsEnabled="False"/>
+                <StackPanel Grid.Column="1" VerticalAlignment="Top">
+                    <Button x:Name="RefreshButton" Content="Refresh Data" IsEnabled="False"/>
+                    <Button x:Name="PreloadButton" Content="Pre-load Assignments" IsEnabled="False" ToolTip="Pre-loads policy and app assignments for faster searches"/>
+                </StackPanel>
             </Grid>
         </Border>
         
@@ -223,6 +226,10 @@ function Connect-ToGraph {
         
         # Initial data load
         FetchIntuneData
+        
+        # Automatically pre-load assignments after initial data load
+        $statusBar.Text = "Starting automatic assignment pre-loading..."
+        PreLoad-PolicyAssignments
     }
     catch {
         $connectionStatus.Text = "Error connecting: $($_.Exception.Message)"
@@ -378,7 +385,7 @@ function FetchIntuneData {
         }
         
         # Data loaded successfully
-        $statusBar.Text = "Data refreshed successfully. Consider clicking 'Pre-load Assignments' for faster group searches."
+        $statusBar.Text = "Basic data loaded. Starting assignment pre-loading automatically..."
     }
     catch {
         $statusBar.Text = "Error refreshing data: $($_.Exception.Message)"
@@ -987,9 +994,14 @@ $searchButton.Add_Click({
     Search-Item
 })
 
+$preloadButton.Add_Click({
+    PreLoad-PolicyAssignments
+})
+
 $searchTextBox.Add_KeyDown({
     param($sender, $e)
-    if ($e.Key -eq 'Return') {
+    
+    if ($e.Key -eq "Return") {
         Search-Item
     }
 })
@@ -1014,6 +1026,10 @@ function PreLoad-PolicyAssignments {
         $global:cachedData.DeviceConfigAssignments = @{}
         $global:cachedData.AppAssignments = @{}
         
+        # Track counts for reporting
+        $totalAssignmentsLoaded = 0
+        $totalPoliciesWithAssignments = 0
+        
         # Load configuration policies if they're not already loaded
         if ($null -eq $global:cachedData.ConfigPolicies) {
             $statusBar.Text = "Loading configuration policies..."
@@ -1034,6 +1050,8 @@ function PreLoad-PolicyAssignments {
                 
                 if ($assignments -and $assignments.Value) {
                     $global:cachedData.ConfigPolicyAssignments[$policy.Id] = $assignments.Value
+                    $totalAssignmentsLoaded += $assignments.Value.Count
+                    $totalPoliciesWithAssignments++
                 }
             }
             catch {
@@ -1061,6 +1079,8 @@ function PreLoad-PolicyAssignments {
                 
                 if ($assignments -and $assignments.Value) {
                     $global:cachedData.CompliancePolicyAssignments[$policy.Id] = $assignments.Value
+                    $totalAssignmentsLoaded += $assignments.Value.Count
+                    $totalPoliciesWithAssignments++
                 }
             }
             catch {
@@ -1088,6 +1108,8 @@ function PreLoad-PolicyAssignments {
                 
                 if ($assignments -and $assignments.Value) {
                     $global:cachedData.DeviceConfigAssignments[$config.Id] = $assignments.Value
+                    $totalAssignmentsLoaded += $assignments.Value.Count
+                    $totalPoliciesWithAssignments++
                 }
             }
             catch {
@@ -1115,6 +1137,8 @@ function PreLoad-PolicyAssignments {
                 
                 if ($assignments -and $assignments.Value) {
                     $global:cachedData.AppAssignments[$app.Id] = $assignments.Value
+                    $totalAssignmentsLoaded += $assignments.Value.Count
+                    $totalPoliciesWithAssignments++
                 }
             }
             catch {
@@ -1122,10 +1146,13 @@ function PreLoad-PolicyAssignments {
             }
         }
         
-        # Update status and disable pre-load button (since data is now loaded)
-        $statusBar.Text = "Assignment data pre-loaded! Group searches will now be faster."
+        # Update status with counts and disable pre-load button (since data is now loaded)
+        $statusBar.Text = "Assignment data pre-loaded: $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources."
         $preloadButton.Content = "Assignments Pre-loaded"
         $preloadButton.IsEnabled = $false
+        
+        # Add tooltip with details
+        $preloadButton.ToolTip = "Loaded $totalAssignmentsLoaded assignments for $totalPoliciesWithAssignments resources (policies, configurations, and apps)"
     }
     catch {
         $statusBar.Text = "Error pre-loading assignments: $($_.Exception.Message)"
@@ -1135,18 +1162,6 @@ function PreLoad-PolicyAssignments {
         Show-Progress $false
     }
 }
-
-# Add a button to pre-load assignments
-$preloadButton = New-Object System.Windows.Controls.Button
-$preloadButton.Content = "Pre-load Assignments"
-$preloadButton.VerticalAlignment = "Top"
-$preloadButton.Margin = New-Object System.Windows.Thickness(5, 0, 5, 0)
-$preloadButton.IsEnabled = $false
-$window.FindName('ConnectButton').Parent.Children.Add($preloadButton)
-
-$preloadButton.Add_Click({
-    PreLoad-PolicyAssignments
-})
 
 # Start the application
 $window.ShowDialog() | Out-Null 
