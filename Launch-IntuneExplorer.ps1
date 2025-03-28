@@ -26,7 +26,7 @@ if (-not $SkipModuleCheck) {
     # Test for required modules
     if (-not (Test-RequiredModules -InstallMissing:$InstallMissing -Force:$Force)) {
         Write-Host "`nRequired modules are missing. Please run the script with -InstallMissing parameter to install them." -ForegroundColor Red
-        Write-Host "Example: .\IntuneExplorer.ps1 -InstallMissing" -ForegroundColor Yellow
+        Write-Host "Example: .\Launch-IntuneExplorer.ps1 -InstallMissing" -ForegroundColor Yellow
         exit
     }
 }
@@ -35,7 +35,7 @@ else {
 }
 
 # Load the main application
-$mainScript = Join-Path -Path $srcPath -ChildPath "IntuneExplorer.ps1"
+$mainScript = Join-Path -Path $srcPath -ChildPath "IntuneExplorer-Main.ps1"
 if (Test-Path $mainScript) {
     # Execute the main script
     if ($SkipModuleCheck) {
