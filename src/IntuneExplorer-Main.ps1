@@ -214,7 +214,7 @@ $jobTimer.Add_Tick({
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <TextBlock Text="Connection Output" Foreground="#E0E0E0" FontWeight="Bold" Margin="0,0,0,5"/>
-                <ScrollViewer Grid.Row="1" Height="100" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                <ScrollViewer x:Name="TerminalScrollViewer" Grid.Row="1" Height="100" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
                     <TextBox x:Name="TerminalOutput" Background="#1E1E1E" Foreground="#00FF00" FontFamily="Consolas" 
                              IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True" BorderThickness="0"/>
                 </ScrollViewer>
@@ -292,6 +292,7 @@ $statusBar = $window.FindName('StatusBar')
 $progressIndicator = $window.FindName('ProgressIndicator')
 $preloadButton = $window.FindName('PreloadButton')
 $terminalOutput = $window.FindName('TerminalOutput')
+$terminalScrollViewer = $window.FindName('TerminalScrollViewer')
 
 # Initialize the terminal with a welcome message
 $terminalOutput.AppendText("Welcome to Intune Explorer - Terminal view is active`n")
@@ -337,9 +338,21 @@ function Write-Terminal {
     
     if ($null -eq $terminalOutput) { return }
     
-    $timestamp = Get-Date -Format "HH:mm:ss"
-    $terminalOutput.AppendText("[$timestamp] $message`n")
-    $terminalOutput.ScrollToEnd()
+    # Get the current dispatcher to ensure UI updates happen on the UI thread
+    $dispatcher = $terminalOutput.Dispatcher
+    
+    $dispatcher.Invoke([Action]{
+        $timestamp = Get-Date -Format "HH:mm:ss"
+        $terminalOutput.AppendText("[$timestamp] $message`n")
+        
+        # Force the terminal to scroll to the end
+        $terminalOutput.ScrollToEnd()
+        
+        # Also scroll the containing ScrollViewer to ensure visibility
+        if ($null -ne $terminalScrollViewer) {
+            $terminalScrollViewer.ScrollToEnd()
+        }
+    }, [System.Windows.Threading.DispatcherPriority]::Background)
 }
 
 # Function to clear the terminal output
