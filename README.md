@@ -1,4 +1,5 @@
 # Intune Explorer
+100% vibe coding :-)
 
 A modern WPF-based GUI for exploring Microsoft Intune data. This application connects to Microsoft Graph API and allows you to search for devices and Entra ID groups, and view related information in a tree-structured format with a clean, user-friendly interface.
 
